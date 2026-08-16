@@ -1,0 +1,26 @@
+# Never publish secrets, even if they appear below an allowed directory.
+.env
+.env.*
+
+# Publish only the explicitly selected root entries.
+/*
+!/.gitignore
+!/LICENSE
+!/README.md
+!/.env.example
+!/requirements.txt
+!/complex_rag/
+!/scripts/
+
+# Python and tool caches inside published directories.
+__pycache__/
+*.py[cod]
+*.pyd
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Editor and operating-system files inside published directories.
+.DS_Store
+Thumbs.db
+*.log
