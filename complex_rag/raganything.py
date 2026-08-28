@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import inspect
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable
@@ -22,7 +23,7 @@ from complex_rag.modalprocessors import (
 )
 from complex_rag.parser import MineruParser
 from complex_rag.processor import ProcessorMixin
-from complex_rag.query import QueryMixin
+from complex_rag.query import FINAL_TOP_K, RETRIEVAL_CANDIDATE_K, QueryMixin
 from complex_rag.utils import chunking_by_page
 
 
@@ -34,10 +35,16 @@ class RAGAnything(QueryMixin, ProcessorMixin):
     llm_model_func: Callable[..., Any] | None = None
     vision_model_func: Callable[..., Any] | None = None
     embedding_func: Callable[..., Any] | None = None
+    rerank_model_func: Callable[..., Any] | None = None
     config: RAGAnythingConfig | None = None
     lightrag_kwargs: dict[str, Any] = field(default_factory=dict)
     modal_processors: dict[str, Any] = field(default_factory=dict, init=False)
     context_extractor: ContextExtractor | None = field(default=None, init=False)
+    _lightrag_rerank_func: Callable[..., Any] | None = field(
+        default=None,
+        init=False,
+        repr=False,
+    )
 
     def __post_init__(self) -> None:
 
@@ -93,6 +100,9 @@ class RAGAnything(QueryMixin, ProcessorMixin):
                 "embedding_func": self.embedding_func,
                 "chunking_func": chunking_by_page,
             }
+            if self.rerank_model_func is not None:
+                self._lightrag_rerank_func = self._build_rerank_model_func()
+                params["rerank_model_func"] = self._lightrag_rerank_func
             params.update(self.lightrag_kwargs)
 
             self.lightrag = LightRAG(**params)
@@ -115,6 +125,43 @@ class RAGAnything(QueryMixin, ProcessorMixin):
             self.llm_model_func = getattr(self.lightrag, "llm_model_func", None)
         if self.embedding_func is None:
             self.embedding_func = getattr(self.lightrag, "embedding_func", None)
+        if self.rerank_model_func is None:
+            self.rerank_model_func = getattr(
+                self.lightrag,
+                "rerank_model_func",
+                None,
+            )
+        if self.rerank_model_func is not None:
+            self._lightrag_rerank_func = self._build_rerank_model_func()
+            self.lightrag.rerank_model_func = self._lightrag_rerank_func
+
+    def _build_rerank_model_func(self) -> Callable[..., Any]:
+        """创建只处理前 30 条候选并返回 Top 5 的纯函数包装。"""
+
+        if self.rerank_model_func is None:
+            raise RuntimeError("rerank_model_func is not configured")
+        provider = self.rerank_model_func
+
+        async def rerank_documents(
+            query: str,
+            documents: list[str],
+            top_n: int | None = None,
+        ) -> list[dict[str, Any]]:
+            candidates = documents[:RETRIEVAL_CANDIDATE_K]
+            if not candidates:
+                return []
+            result = provider(
+                query=query,
+                documents=candidates,
+                top_n=min(FINAL_TOP_K, len(candidates)),
+            )
+            if inspect.isawaitable(result):
+                result = await result
+            if not isinstance(result, list) or not result:
+                raise ValueError("Reranker returned no results")
+            return result[:FINAL_TOP_K]
+
+        return rerank_documents
 
     def _initialize_processors(self) -> None:
         """根据配置创建第一版图片和表格处理器。

@@ -9,8 +9,13 @@ from lightrag import QueryParam
 from lightrag.operate import kg_query
 from lightrag.utils import logger
 
-from complex_rag.prompt import VLM_QUERY_SYSTEM
+from complex_rag.calculator import replace_calculation_markers
+from complex_rag.prompt import CONCISE_ANSWER_PROMPT, VLM_QUERY_SYSTEM
 from complex_rag.utils import encode_image_to_base64
+
+
+RETRIEVAL_CANDIDATE_K = 30
+FINAL_TOP_K = 5
 
 
 class QueryMixin:
@@ -23,28 +28,15 @@ class QueryMixin:
         system_prompt: str | None = None,
         **kwargs: Any,
     ) -> str:
-        """执行查询；有视觉模型时自动尝试 VLM 增强。"""
+        """执行统一宽召回、重排和简洁回答。"""
 
-        if self.vision_model_func is not None:
-            return await self.aquery_vlm_enhanced(
-                query,
-                mode=mode,
-                system_prompt=system_prompt,
-                **kwargs,
-            )
-
-        init_result = await self._ensure_lightrag_initialized()
-        if not init_result.get("success"):
-            raise RuntimeError(
-                f"LightRAG initialization failed: {init_result.get('error')}"
-            )
-
-        logger.info("Executing LightRAG query in %s mode", mode)
-        return await self.lightrag.aquery(
+        trace = await self.aquery_with_trace(
             query,
-            param=QueryParam(mode=mode, **kwargs),
+            mode=mode,
             system_prompt=system_prompt,
+            **kwargs,
         )
+        return str(trace["answer"])
 
     async def aquery_vlm_enhanced(
         self,
@@ -54,40 +46,18 @@ class QueryMixin:
         extra_safe_dirs: list[str] | None = None,
         **kwargs: Any,
     ) -> str:
-        """先检索 LightRAG Prompt；召回有效图片时再调用 VLM 回答。"""
+        """显式要求视觉模型可用，并执行统一查询流程。"""
 
         if self.vision_model_func is None:
             raise ValueError("VLM enhanced query requires vision_model_func")
-
-        init_result = await self._ensure_lightrag_initialized()
-        if not init_result.get("success"):
-            raise RuntimeError(
-                f"LightRAG initialization failed: {init_result.get('error')}"
-            )
-
-        # 只取得 LightRAG 已组装的检索 Prompt，不先生成普通文本答案。
-        retrieval_param = QueryParam(mode=mode, only_need_prompt=True, **kwargs)
-        raw_prompt = await self.lightrag.aquery(query, param=retrieval_param)
-        enhanced_prompt, images_found = self._process_image_paths_for_vlm(
-            str(raw_prompt),
-            extra_safe_dirs=extra_safe_dirs,
-        )
-
-        if images_found == 0:
-            logger.info(
-                "No valid images found; answering with the retrieved prompt"
-            )
-            return await self.llm_model_func(
-                str(raw_prompt),
-                system_prompt=system_prompt,
-            )
-
-        messages = self._build_vlm_messages_with_images(
-            enhanced_prompt,
+        trace = await self.aquery_with_trace(
             query,
-            system_prompt,
+            mode=mode,
+            system_prompt=system_prompt,
+            extra_safe_dirs=extra_safe_dirs,
+            **kwargs,
         )
-        return await self._call_vlm_with_multimodal_content(messages)
+        return str(trace["answer"])
 
     async def aquery_with_trace(
         self,
@@ -106,12 +76,22 @@ class QueryMixin:
             )
         if mode != "mix":
             raise ValueError("Traced evaluation queries only support mix mode")
+        if not callable(getattr(self, "rerank_model_func", None)):
+            raise RuntimeError(
+                "Query requires a reranker; configure RERANK_MODEL and "
+                "RERANK_BASE_URL"
+            )
 
+        query_options = dict(kwargs)
+        query_options["chunk_top_k"] = RETRIEVAL_CANDIDATE_K
+        query_options["enable_rerank"] = True
+        query_options.pop("only_need_prompt", None)
+        query_options.pop("stream", None)
         query_param = QueryParam(
             mode=mode,
             only_need_prompt=True,
             stream=False,
-            **kwargs,
+            **query_options,
         )
         try:
             query_result = await kg_query(
@@ -130,29 +110,87 @@ class QueryMixin:
             await self.lightrag._query_done()
 
         if query_result is None:
-            return {"answer": "未检索到相关证据。", "evidence": []}
+            return {
+                "answer": "未检索到相关证据。",
+                "evidence": [],
+            }
 
         raw_prompt = str(query_result.content)
         raw_data = query_result.raw_data or {}
         evidence = await self._enrich_evidence(raw_data)
-        enhanced_prompt, images_found = self._process_image_paths_for_vlm(
+        if len(evidence) > FINAL_TOP_K:
+            raise RuntimeError(
+                "Reranker did not reduce retrieval results to the required Top 5"
+            )
+        answer = await self._answer_from_retrieval(
+            query,
             raw_prompt,
+            system_prompt=system_prompt,
             extra_safe_dirs=extra_safe_dirs,
         )
-        if images_found and self.vision_model_func is not None:
-            messages = self._build_vlm_messages_with_images(
-                enhanced_prompt,
-                query,
-                system_prompt,
-            )
-            answer = await self._call_vlm_with_multimodal_content(messages)
-        else:
-            answer = await self.llm_model_func(
-                raw_prompt,
-                system_prompt=system_prompt,
-            )
+        return {
+            "answer": str(answer),
+            "evidence": evidence,
+        }
 
-        return {"answer": str(answer), "evidence": evidence}
+    async def _answer_from_retrieval(
+        self,
+        query: str,
+        raw_prompt: str,
+        system_prompt: str | None,
+        extra_safe_dirs: list[str] | None,
+    ) -> str:
+        """将重排后的检索上下文直接交给回答模型。"""
+
+        answer_prompt = (
+            f"{raw_prompt}\n\n"
+            + CONCISE_ANSWER_PROMPT.format(
+                query=query,
+            )
+        )
+        raw_answer = await self._call_answer_model(
+            answer_prompt,
+            query,
+            system_prompt=system_prompt,
+            extra_safe_dirs=extra_safe_dirs,
+        )
+        return replace_calculation_markers(str(raw_answer).strip())
+
+    async def _call_answer_model(
+        self,
+        prompt: str,
+        user_query: str,
+        system_prompt: str | None,
+        extra_safe_dirs: list[str] | None,
+    ) -> str:
+        """生成对用户可见的简洁自然语言答案。"""
+
+        if self.vision_model_func is not None:
+            enhanced_prompt, images_found = self._process_image_paths_for_vlm(
+                prompt,
+                extra_safe_dirs=extra_safe_dirs,
+            )
+            if images_found:
+                messages = self._build_vlm_messages_with_images(
+                    enhanced_prompt,
+                    user_query,
+                    system_prompt,
+                    final_instruction=(
+                        "请直接给出简洁答案。涉及计算时，最终计算结果必须使用"
+                        "[[CALC:四则运算表达式|小数位数]]占位，最多附一行计算式。"
+                    ),
+                )
+                response = await self._call_vlm_with_multimodal_content(messages)
+                return str(response).strip()
+
+        full_system_prompt = VLM_QUERY_SYSTEM
+        if system_prompt:
+            full_system_prompt = f"{full_system_prompt}\n{system_prompt}"
+        response = await self.llm_model_func(
+            prompt,
+            system_prompt=full_system_prompt,
+        )
+        return str(response).strip()
 
     async def _enrich_evidence(
         self,
@@ -173,6 +211,7 @@ class QueryMixin:
             evidence.append(
                 {
                     "rank": rank,
+                    "reference_id": chunk.get("reference_id"),
                     "chunk_id": chunk.get("chunk_id", ""),
                     "file_path": chunk.get("file_path", "unknown_source"),
                     "page_idx": page_idx,
@@ -212,6 +251,7 @@ class QueryMixin:
         safe_dirs.extend(Path(path).resolve() for path in extra_safe_dirs or [])
 
         def replace_image_path(match: re.Match[str]) -> str:
+            # 将单个安全图片路径替换为 VLM 标记。
             nonlocal images_processed
 
             image_path = Path(match.group(1).strip())
@@ -259,6 +299,7 @@ class QueryMixin:
         enhanced_prompt: str,
         user_query: str,
         system_prompt: str | None = None,
+        final_instruction: str | None = None,
     ) -> list[dict[str, Any]]:
         """根据 Prompt 中的标记，把文本和 base64 图片按原位置组成消息。"""
 
@@ -292,7 +333,10 @@ class QueryMixin:
         content_parts.append(
             {
                 "type": "text",
-                "text": f"\n用户问题：{user_query}\n请根据以上上下文和图片回答。",
+                "text": (
+                    f"\n用户问题：{user_query}\n"
+                    f"{final_instruction or '请根据以上上下文和图片回答。'}"
+                ),
             }
         )
         full_system_prompt = VLM_QUERY_SYSTEM

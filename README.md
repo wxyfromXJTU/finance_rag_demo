@@ -36,8 +36,10 @@ PDF
 
 ```text
 用户问题
-  → LightRAG mix检索（only_need_prompt=True）
-  → 得到包含检索上下文和用户问题的完整Prompt
+  → LightRAG mix宽召回30条候选chunk
+  → 外部reranker按问题与chunk相关性重新打分
+  → 保留最终Top 5
+  → 得到包含Top 5检索上下文和用户问题的完整Prompt
   → 检查Prompt中的图片路径
       ├─ 有合法图片 → Prompt + 原图 → VLM回答
       └─ 无合法图片 → 同一Prompt → 文本LLM回答
@@ -45,8 +47,6 @@ PDF
 
 
 ## 2. 首次使用：重新解析并建立 storage
-
-建议使用 Python 3.12，并始终从项目根目录运行命令。
 
 运行前编辑本地 `.env`，至少填写 `OPENAI_API_KEY`、`LLM_MODEL`、`VISION_MODEL` 和
 `EMBEDDING_MODEL`。如果使用兼容 OpenAI API 的服务，再设置 `OPENAI_BASE_URL`。
@@ -65,17 +65,13 @@ MinerU 图片会保存在 `OUTPUT_DIR`。VLM 查询依赖这些图片的实际�
 ## 3. 运行命令
 
 ### 3.1 索引单个 PDF
-
+示例：
 ```powershell
 .\.venv\Scripts\python.exe -B scripts\index.py data\pdf\example.pdf --lang ch
 ```
 
-需要排障时追加 `--verbose`。命令会执行完整解析和入库，并在 `finally` 中刷新
-storage。输出中的多模态 `failed` 大于 0 表示存在部分失败，不能只根据命令没有抛出
-异常判断整份文档完全成功。
-
 ### 3.2 批量索引
-
+示例：
 ```powershell
 .\.venv\Scripts\python.exe -B scripts\batch_index.py data\pdf_ch --lang ch
 ```
@@ -84,45 +80,17 @@ storage。输出中的多模态 `failed` 大于 0 表示存在部分失败，不
 `experiment_results/index_status.jsonl`。首次运行会拒绝非空 `WORKING_DIR`。中断后用
 相同命令追加 `--resume`：
 
-```powershell
-.\.venv\Scripts\python.exe -B scripts\batch_index.py data\pdf_ch --lang ch --resume
-```
-
-`--resume` 会跳过 `success` 和 `partial`，并重试 `failed`。索引不是事务操作；如果
-失败发生在正文写入之后，直接重试可能造成重复内容，正式实验优先在新的空
-`WORKING_DIR` 中重建。
-
 ### 3.3 正式评测
-
-评测前必须已经使用当前代码建立索引，并保留相同的 PDF 和 MinerU `output/`。查询文件
-是 JSON 数组，至少包含 `query-id`、`query`、`answer` 和 `from_pages`；其中
-`query-id` 必须以对应 PDF 的文件名 stem 加下划线开头，例如：
-
-```json
-[
-  {
-    "query-id": "example_001",
-    "query": "公司的营业收入是多少？",
-    "answer": "示例答案",
-    "from_pages": [1],
-    "category": "财务指标"
-  }
-]
-```
-
-运行评测：
-
+示例：
 ```powershell
-.\.venv\Scripts\python.exe -B scripts\evaluate.py --queries data\queries_ch.json --pdf-dir data\pdf_ch
+python -B scripts\evaluate.py --queries data\queries_ch.json --pdf-dir data\pdf_ch --result-dir experiment_results/eval_ch_v1
 ```
 
-评测只使用 `mix`，计算页级 Hit@1、Hit@5、数字准确性、
-Faithfulness 和 Answer Relevancy。中断后可在原命令末尾追加 `--resume`。默认产物为：
+评测只使用 `mix`，统一宽召回30条候选chunk，经reranker重排后输出最终Top 5，
+并计算页级 Hit@5 和数字准确性。生成质量通过两次相互隔离的Judge调用评估：
 
-- `experiment_results/eval_ch/results.jsonl`：逐题明细。
-- `experiment_results/eval_ch/summary.json`：JSON 汇总。
-- `experiment_results/eval_ch/summary.csv`：总体及分组指标。
-- `experiment_results/eval_ch/report.html`：答案与证据对照报告。
+- 第一次只读取问题、生成答案和实际Top 5证据，计算 Faithfulness 和 Answer Relevancy。
+- 第二次只读取问题、标准答案和生成答案，计算 Answer Correctness，避免标准答案污染Faithfulness。
 
 ## 4. 致谢与参考
 

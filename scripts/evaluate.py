@@ -48,7 +48,36 @@ JUDGE_PROMPT = """请评估以下回答：
   "answer_relevancy": {{"score": 0, "reason": "简短理由"}}
 }}"""
 
+CORRECTNESS_JUDGE_SYSTEM_PROMPT = """你是严格的金融问答正确性评测员。只能比较标准答案与待评回答，不得使用外部知识。
+请只返回一个 JSON 对象，不要输出 Markdown。"""
+
+CORRECTNESS_JUDGE_PROMPT = """请评估以下回答与标准答案是否一致：
+
+问题：
+{question}
+
+标准答案：
+{reference_answer}
+
+待评回答：
+{answer}
+
+给出 answer_correctness 的 0 到 4 整数分：
+- 4：核心结论完全正确，事实、数字、正负方向、单位和时期均与标准答案一致；数学等价表达或合理四舍五入也视为正确。
+- 3：核心结论正确，仅有不影响结论的轻微精度、措辞或次要遗漏。
+- 2：部分内容正确，但存在重要遗漏，或部分关键数字、单位、时期错误。
+- 1：仅有少量信息正确，核心结论错误。
+- 0：完全错误、与标准答案矛盾或没有回答问题。
+
+不要因为表述方式不同而扣分；重点检查答案语义是否与标准答案一致。
+
+返回格式：
+{{
+  "answer_correctness": {{"score": 0, "reason": "简短理由", "errors": []}}
+}}"""
+
 NUMBER_PATTERN = re.compile(r"[-+]?\d+(?:\.\d+)?%?")
+EVALUATION_SCHEMA_VERSION = 4
 
 
 def _load_queries(path: Path) -> list[dict[str, Any]]:
@@ -164,36 +193,33 @@ def _normalize_number_text(text: str) -> str:
 
 
 def _extract_numbers(text: str) -> list[str]:
-    values: list[str] = []
-    for value in NUMBER_PATTERN.findall(_normalize_number_text(text)):
-        if value not in values:
-            values.append(value)
-    return values
+    return NUMBER_PATTERN.findall(_normalize_number_text(text))
 
 
 def _numeric_metrics(reference: str, answer: str) -> dict[str, Any]:
     reference_numbers = _extract_numbers(reference)
     normalized_answer = _normalize_number_text(answer)
-    answer_numbers = set(_extract_numbers(normalized_answer))
+    answer_numbers = _extract_numbers(normalized_answer)
+    remaining_matches: dict[str, int] = {}
 
-    def appears(number: str) -> bool:
+    def match_once(number: str) -> bool:
         pattern = rf"(?<![\d.]){re.escape(number)}(?![\d.])"
-        return re.search(pattern, normalized_answer) is not None
+        if number not in remaining_matches:
+            remaining_matches[number] = len(re.findall(pattern, normalized_answer))
+        if remaining_matches[number] == 0:
+            return False
+        remaining_matches[number] -= 1
+        return True
 
-    matched = [number for number in reference_numbers if appears(number)]
+    matched = [number for number in reference_numbers if match_once(number)]
     applicable = bool(reference_numbers)
     return {
         "applicable": applicable,
         "reference_numbers": reference_numbers,
-        "answer_numbers": sorted(answer_numbers),
+        "answer_numbers": sorted(set(answer_numbers)),
         "matched_numbers": matched,
-        "recall": (
-            len(matched) / len(reference_numbers) if reference_numbers else None
-        ),
         "accuracy": (
-            int(len(matched) == len(reference_numbers))
-            if reference_numbers
-            else None
+            len(matched) / len(reference_numbers) if reference_numbers else None
         ),
     }
 
@@ -263,6 +289,32 @@ def _parse_judge_response(response: str) -> dict[str, Any]:
     return result
 
 
+def _parse_correctness_judge_response(response: str) -> dict[str, Any]:
+    """解析独立正确性Judge返回的单个指标。"""
+
+    cleaned = re.sub(
+        r"<think(?:ing)?>.*?</think(?:ing)?>",
+        "",
+        str(response),
+        flags=re.DOTALL | re.IGNORECASE,
+    ).strip()
+    if cleaned.startswith("```"):
+        cleaned = re.sub(r"^```(?:json)?\s*|\s*```$", "", cleaned).strip()
+    start, end = cleaned.find("{"), cleaned.rfind("}")
+    if start < 0 or end < start:
+        raise ValueError("Correctness Judge did not return a JSON object")
+    data = json.loads(cleaned[start : end + 1])
+    metric = data["answer_correctness"]
+    score = int(metric["score"])
+    if not 0 <= score <= 4:
+        raise ValueError("Correctness Judge score out of range")
+    return {
+        **metric,
+        "score": score,
+        "normalized_score": score / 4,
+    }
+
+
 def _format_evidence_for_judge(evidence: list[dict[str, Any]]) -> str:
     if not evidence:
         return "（无检索证据）"
@@ -294,6 +346,19 @@ def _latest_records(path: Path) -> list[dict[str, Any]]:
     return list(latest.values())
 
 
+def _validate_resume_schema(records: list[dict[str, Any]]) -> None:
+    incompatible = [
+        record.get("query_id", "")
+        for record in records
+        if record.get("evaluation_schema_version") != EVALUATION_SCHEMA_VERSION
+    ]
+    if incompatible:
+        raise ValueError(
+            "Existing results use an incompatible evaluation schema; "
+            "use a new --result-dir"
+        )
+
+
 def _mean(values: list[float | int | None]) -> float | None:
     present = [float(value) for value in values if value is not None]
     return sum(present) / len(present) if present else None
@@ -306,18 +371,17 @@ def _summarize(records: list[dict[str, Any]]) -> dict[str, Any]:
             item for item in successful if item.get("numeric", {}).get("applicable")
         ]
         judged_records = [item for item in successful if item.get("judge")]
+        correctness_records = [
+            item for item in successful if item.get("answer_correctness")
+        ]
         return {
             "count": len(group),
             "completed": len(successful),
             "error_rate": (len(group) - len(successful)) / len(group),
-            "hit_at_1": _mean([item.get("hit_at_1") for item in successful]),
             "hit_at_5": _mean([item.get("hit_at_5") for item in successful]),
             "numeric_count": len(numeric_records),
             "numeric_accuracy": _mean(
                 [item.get("numeric", {}).get("accuracy") for item in numeric_records]
-            ),
-            "numeric_recall": _mean(
-                [item.get("numeric", {}).get("recall") for item in numeric_records]
             ),
             "judge_count": len(judged_records),
             "faithfulness": _mean(
@@ -336,11 +400,24 @@ def _summarize(records: list[dict[str, Any]]) -> dict[str, Any]:
                     for item in successful
                 ]
             ),
+            "correctness_judge_count": len(correctness_records),
+            "answer_correctness": _mean(
+                [
+                    item.get("answer_correctness", {}).get("normalized_score")
+                    for item in successful
+                ]
+            ),
             "query_seconds": _mean(
                 [item.get("timing", {}).get("query_seconds") for item in successful]
             ),
             "judge_seconds": _mean(
                 [item.get("timing", {}).get("judge_seconds") for item in successful]
+            ),
+            "correctness_judge_seconds": _mean(
+                [
+                    item.get("timing", {}).get("correctness_judge_seconds")
+                    for item in successful
+                ]
             ),
         }
 
@@ -369,16 +446,17 @@ def _write_summary_csv(path: Path, summary: dict[str, Any]) -> None:
         "count",
         "completed",
         "error_rate",
-        "hit_at_1",
         "hit_at_5",
         "numeric_count",
         "numeric_accuracy",
-        "numeric_recall",
         "judge_count",
         "faithfulness",
         "answer_relevancy",
+        "correctness_judge_count",
+        "answer_correctness",
         "query_seconds",
         "judge_seconds",
+        "correctness_judge_seconds",
     ]
     with path.open("w", encoding="utf-8-sig", newline="") as stream:
         writer = csv.DictWriter(stream, fieldnames=fieldnames)
@@ -429,10 +507,16 @@ def _write_html_report(
             .get("answer_relevancy", {})
             .get("normalized_score")
         )
+        correctness = record.get("answer_correctness", {}).get(
+            "normalized_score"
+        )
         judge_reason = "；".join(
             str(metric.get("reason", ""))
             for metric in record.get("judge", {}).values()
             if metric.get("reason")
+        )
+        correctness_reason = str(
+            record.get("answer_correctness", {}).get("reason", "")
         )
         cards.append(
             "<section>"
@@ -441,10 +525,11 @@ def _write_html_report(
             f"<p class='meta'>{html.escape(types['category'])} · "
             f"{html.escape(types['answer_type'])} · gold pages "
             f"{html.escape(str(record['from_pages']))} · "
-            f"Hit@1={record['hit_at_1']} Hit@5={record['hit_at_5']} · "
+            f"Hit@5={record['hit_at_5']} · "
             f"Numeric={numeric_accuracy} · Faithfulness={faithfulness} · "
-            f"Relevancy={relevancy}</p>"
-            f"<p class='meta'>{html.escape(judge_reason)}</p>"
+            f"Relevancy={relevancy} · Correctness={correctness}</p>"
+            f"<p class='meta'>证据Judge：{html.escape(judge_reason)}</p>"
+            f"<p class='meta'>正确性Judge：{html.escape(correctness_reason)}</p>"
             "<div class='grid'>"
             f"<div><h3>标准答案</h3><pre>{html.escape(record['reference_answer'])}</pre></div>"
             f"<div><h3>生成答案</h3><pre>{html.escape(record['generated_answer'])}</pre></div>"
@@ -506,9 +591,12 @@ async def main() -> None:
     pdf_files = sorted(pdf_dir.glob("*.pdf"), key=lambda path: path.name)
     if not pdf_files:
         raise ValueError(f"No PDF files found in: {pdf_dir}")
+    existing_records = _latest_records(result_file) if result_file.exists() else []
+    if args.resume:
+        _validate_resume_schema(existing_records)
     completed = {
         record["query_id"]
-        for record in (_latest_records(result_file) if result_file.exists() else [])
+        for record in existing_records
         if record.get("status") == "success"
     }
     judge_model, judge_model_func = _build_judge()
@@ -537,7 +625,6 @@ async def main() -> None:
                 trace = await rag.aquery_with_trace(
                     str(query["query"]),
                     mode="mix",
-                    chunk_top_k=8,
                     response_type="简洁的最终答案",
                 )
                 query_seconds = time.perf_counter() - query_started
@@ -567,9 +654,36 @@ async def main() -> None:
                     judge_error = str(exc)
                 judge_seconds = time.perf_counter() - judge_started
 
+                correctness_judge_started = time.perf_counter()
+                correctness_judge_error = None
+                answer_correctness: dict[str, Any] = {}
+                try:
+                    correctness_prompt = CORRECTNESS_JUDGE_PROMPT.format(
+                        question=query["query"],
+                        reference_answer=query["answer"],
+                        answer=answer,
+                    )
+                    correctness_response = await judge_model_func(
+                        correctness_prompt,
+                        system_prompt=CORRECTNESS_JUDGE_SYSTEM_PROMPT,
+                    )
+                    answer_correctness = _parse_correctness_judge_response(
+                        str(correctness_response)
+                    )
+                except Exception as exc:
+                    correctness_judge_error = str(exc)
+                correctness_judge_seconds = (
+                    time.perf_counter() - correctness_judge_started
+                )
+
                 record = {
+                    "evaluation_schema_version": EVALUATION_SCHEMA_VERSION,
                     "query_id": query_id,
-                    "status": "success" if judge_error is None else "partial",
+                    "status": (
+                        "success"
+                        if judge_error is None and correctness_judge_error is None
+                        else "partial"
+                    ),
                     "document": pdf_path.name,
                     "question": query["query"],
                     "types": _question_types(query, pages),
@@ -578,20 +692,26 @@ async def main() -> None:
                     "generated_answer": answer,
                     "gold_evidence": gold,
                     "retrieved_evidence": evidence,
-                    "hit_at_1": _hit_at_k(evidence, pages, 1),
                     "hit_at_5": _hit_at_k(evidence, pages, 5),
                     "numeric": _numeric_metrics(str(query["answer"]), answer),
                     "judge_model": judge_model,
                     "judge": judge,
                     "judge_error": judge_error,
+                    "answer_correctness": answer_correctness,
+                    "correctness_judge_error": correctness_judge_error,
                     "timing": {
                         "query_seconds": round(query_seconds, 3),
                         "judge_seconds": round(judge_seconds, 3),
+                        "correctness_judge_seconds": round(
+                            correctness_judge_seconds,
+                            3,
+                        ),
                         "total_seconds": round(time.perf_counter() - started_at, 3),
                     },
                 }
             except Exception as exc:
                 record = {
+                    "evaluation_schema_version": EVALUATION_SCHEMA_VERSION,
                     "query_id": query_id,
                     "status": "error",
                     "question": query.get("query", ""),

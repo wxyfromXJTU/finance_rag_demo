@@ -8,6 +8,7 @@ import sys
 from functools import partial
 from pathlib import Path
 
+import httpx
 from dotenv import load_dotenv
 
 # 直接执行脚本时，把项目根目录加入模块搜索路径。
@@ -47,6 +48,57 @@ def _required_env(name: str) -> str:
     return value
 
 
+async def _call_rerank_api(
+    query: str,
+    documents: list[str],
+    model: str,
+    base_url: str,
+    api_key: str,
+    top_n: int | None,
+) -> list[dict[str, int | float]]:
+    """通过支持系统代理的 HTTP 客户端调用 AIHubMix 重排接口。"""
+
+    # 与 LLM 请求一样读取 VPN 或系统提供的代理环境。
+    payload = {
+        "model": model,
+        "query": query,
+        "documents": documents,
+        "top_n": top_n,
+        "return_documents": False,
+    }
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+    }
+    timeout = httpx.Timeout(60.0, connect=20.0)
+    async with httpx.AsyncClient(
+        timeout=timeout,
+        follow_redirects=True,
+        trust_env=True,
+    ) as client:
+        for attempt in range(3):
+            try:
+                response = await client.post(base_url, headers=headers, json=payload)
+                response.raise_for_status()
+                break
+            except httpx.TransportError:
+                if attempt == 2:
+                    raise
+                await asyncio.sleep(2**attempt)
+
+    data = response.json()
+    results = data.get("results", [])
+    if not isinstance(results, list):
+        raise ValueError("Reranker response field 'results' must be a list")
+    return [
+        {
+            "index": int(item["index"]),
+            "relevance_score": float(item["relevance_score"]),
+        }
+        for item in results
+    ]
+
+
 def _build_rag() -> RAGAnything:
     """根据 .env 创建第一版 RAGAnything 及模型函数。"""
 
@@ -56,6 +108,13 @@ def _build_rag() -> RAGAnything:
     vision_model = _required_env("VISION_MODEL")
     embedding_model = _required_env("EMBEDDING_MODEL")
     embedding_dim = int(os.getenv("EMBEDDING_DIM", "1536"))
+    rerank_model = os.getenv("RERANK_MODEL", "").strip()
+    rerank_base_url = os.getenv("RERANK_BASE_URL", "").strip()
+    if bool(rerank_model) != bool(rerank_base_url):
+        raise ValueError(
+            "RERANK_MODEL and RERANK_BASE_URL must be configured together"
+        )
+    rerank_api_key = os.getenv("RERANK_API_KEY", "").strip() or api_key
 
     def llm_model_func(
         prompt: str,
@@ -134,11 +193,30 @@ def _build_rag() -> RAGAnything:
             base_url=base_url,
         ),
     )
+
+    rerank_model_func = None
+    if rerank_model and rerank_base_url:
+
+        async def rerank_model_func(
+            query: str,
+            documents: list[str],
+            top_n: int | None = None,
+        ):
+            return await _call_rerank_api(
+                query=query,
+                documents=documents,
+                model=rerank_model,
+                base_url=rerank_base_url,
+                api_key=rerank_api_key,
+                top_n=top_n,
+            )
+
     return RAGAnything(
         config=RAGAnythingConfig(),
         llm_model_func=llm_model_func,
         vision_model_func=vision_model_func,
         embedding_func=embedding_func,
+        rerank_model_func=rerank_model_func,
     )
 
 
